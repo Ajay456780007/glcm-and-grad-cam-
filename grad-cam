@@ -1,0 +1,99 @@
+import tensorflow as tf
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+
+def grad_cam_on_image(model_path, image, class_index=None, last_conv_layer_name=None):
+    """
+    Apply Grad-CAM on a given image and return heatmap overlay.
+
+    Args:
+        model_path (str): Path to the saved Keras model (.h5 or SavedModel dir).
+        image (np.ndarray): Input image (H, W, 4) with your 4-channel features.
+        class_index (int, optional): Class index to visualize. If None, uses predicted class.
+        last_conv_layer_name (str, optional): Name of the last conv layer. If None, auto-detects.
+
+    Returns:
+        overlay (np.ndarray): Image with Grad-CAM heatmap overlay.
+    """
+
+    # Load the trained model
+    model = tf.keras.models.load_model(model_path)
+
+    # If last_conv_layer_name is not given, find the last Conv2D layer automatically
+    if last_conv_layer_name is None:
+        for layer in reversed(model.layers):
+            if isinstance(layer, tf.keras.layers.Conv2D):
+                last_conv_layer_name = layer.name
+                break
+
+    # Preprocess image: expand dims for batch
+    input_img = np.expand_dims(image, axis=0).astype(np.float32)
+
+    # Predict and choose class index if not provided
+    preds = model.predict(input_img)
+    if class_index is None:
+        class_index = np.argmax(preds[0])
+
+    # Get the last conv layer
+    last_conv_layer = model.get_layer(last_conv_layer_name)
+
+    # Create a Grad-CAM model that outputs last conv layer + predictions
+    grad_model = tf.keras.models.Model(
+        [model.inputs],
+        [last_conv_layer.output, model.output]
+    )
+
+    # Compute gradient of target class score w.r.t. last conv layer output
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(input_img)
+        loss = predictions[:, class_index]
+
+    grads = tape.gradient(loss, conv_outputs)
+
+    # Compute mean intensity of gradients for each filter
+    weights = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+    # Weighted sum of feature maps
+    cam = np.zeros(conv_outputs.shape[1:3], dtype=np.float32)
+    for i, w in enumerate(weights):
+        cam += w * conv_outputs[0, :, :, i]
+
+    # Apply ReLU to keep only positive influences
+    cam = np.maximum(cam, 0)
+
+    # Normalize heatmap
+    cam = cam / (cam.max() + 1e-8)
+
+    # Resize heatmap to image size
+    heatmap = cv2.resize(cam, (image.shape[1], image.shape[0]))
+
+    # Convert heatmap to RGB
+    heatmap = np.uint8(255 * heatmap)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+    # If your image has 4 channels, for visualization use only first 3 (or a grayscale)
+    if image.shape[2] >= 3:
+        base_img = image[:, :, :3]
+        base_img = (base_img - base_img.min()) / (base_img.max() - base_img.min() + 1e-8)
+        base_img = np.uint8(255 * base_img)
+    else:
+        base_img = np.repeat(image[:, :, 0:1], 3, axis=2)  # grayscale expand
+
+    # Overlay heatmap on image
+    overlay = cv2.addWeighted(base_img, 0.6, heatmap, 0.4, 0)
+
+    return overlay
+
+
+# ---------- Example Usage ----------
+# Suppose your saved model is 'rice_leaf_model.h5'
+# And you have an image from dataset: shape (224, 224, 4)
+"""
+image = np.load("my_rice_leaf_sample.npy")  # Example loading
+result_img = grad_cam_on_image("rice_leaf_model.h5", image)
+
+plt.imshow(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB))
+plt.axis('off')
+plt.show()
+"""
